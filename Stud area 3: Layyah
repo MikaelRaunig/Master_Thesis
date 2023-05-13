@@ -1,0 +1,659 @@
+//////////////////////////////////////////
+///////// 1 Area of interest //////////////
+/////////////////////////////////////////
+
+
+var g2 = ee.Geometry.Polygon(
+    [[
+      [70.96194647533524,30.610300635293196],
+      [70.96194647533524,30.98159487738331],
+      [70.40919684154618,30.98159487738331],
+      [70.40919684154618,30.610300635293196]]]);
+      
+Map.addLayer(g2,
+            {'color': 'black'},
+            'Geometry [black]: polygon', false);
+
+Map.centerObject(g2);
+Map.setZoom(11);
+
+
+///////////////////////////////////////////////
+//// 2 making an rgb image of study area ///
+//////////////////////////////////////////////
+
+var visrgb = {
+  bands:['B4','B3','B2'],
+  min: 500,
+  max:  3500
+};
+
+var test = ee.ImageCollection("COPERNICUS/S2_SR")
+  .filterBounds(g2).select(['B2','B3','B4','B5'])
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE',30)); //FILTER CLOUD COVER
+  
+
+var test_before = test.filter(ee.Filter.date('2022-06-01', '2022-07-01')) //FILTER DATE
+  .mean()
+  .clip(g2);
+  
+Map.addLayer(test_before.select('B3','B2','B4'), visrgb,'rgb_before', false);
+
+var test_after = test.filter(ee.Filter.date('2022-08-25','2022-09-1'))
+.mean()
+.clip(g2);
+
+Map.addLayer(test_after.select('B3','B2','B4'), visrgb, 'rgb after', false)
+
+//////////////////////////////////////////////
+// 3_NDWI_Normalized_Difference_Water_Index and Ratio //
+//////////////////////////////////////////////
+
+var optical = ee.ImageCollection("COPERNICUS/S2_SR")
+  .filterBounds(g2)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE',8)); //FILTER CLOUD COVER
+  
+
+var optical_before = optical.filter(ee.Filter.date('2022-03-01', '2022-06-01')) //FILTER DATE
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE',30))
+  .mean()
+  .clip(g2);
+
+//variables used to figure out number of reference images before we use the .mean() function
+var optical_after_stack = optical.filter(ee.Filter.date('2022-08-28', '2022-09-01')); 
+var optical_before_stack = optical.filter(ee.Filter.date('2022-03-01', '2022-06-01'));
+
+var optical_after = optical.filter(ee.Filter.date('2022-08-28', '2022-09-01'))
+  .mean()
+  .clip(g2);
+
+//CALCULATION OF NDWI WITH SENTINEL 2: (BAND3-BAND8)/(BAND3+BAND8) = GREEN-NIR / GREEN+NIR
+var green_after = optical_after.select('B3');
+var nir_after = optical_after.select('B8');
+var NDWI_after = green_after.subtract(nir_after).divide(green_after.add(nir_after)).rename('NDWI_after');
+
+var green_before = optical_before.select('B3');
+var nir_before = optical_before.select('B8');
+var NDWI_before = green_before.subtract(nir_before).divide(green_before.add(nir_before)).rename('NDWI_before');
+
+// Since water in Layyah is turbulent/has a lot of sediment in supension, we try to vizualize inundation with ratio index in addition to the NDWI
+var ratiovis = {
+  min:0,
+  max:2,
+
+ palette:['FF0000', 'FFA500', 'FFFF00', 'ADD8E6','0ba4d6','00008B','000053']
+};
+
+//calculate ratio green/nir
+
+var ratio_after = green_after.divide(nir_after).rename('ratio after');
+var ratio_before = green_before.divide(nir_before).rename('ratio before');
+Map.addLayer(ratio_after, ratiovis, 'ratio after', false);
+Map.addLayer(ratio_before, ratiovis, 'ratio before', false);
+
+// ratio mask,  best results found on threshold: 0.79
+var flood_ratio = ratio_before.lt(0.79).and(ratio_after.gt(0.79));
+var floodmask_ratio = flood_ratio.updateMask(flood_ratio.eq(1));
+Map.addLayer(floodmask_ratio, {palette:['Red']}, 'ratio flood mask', false);
+
+// CREATE A PALETTE COLOR SCHEME FOR THE NDWI LAYER
+var ndwiParams = {
+  min: -1, max: 1, 
+  palette: ['FF0000', 'FFA500', 'FFFF00', 'ADD8E6','0ba4d6','00008B','000053']
+};
+
+Map.addLayer(NDWI_after, ndwiParams, 'NDWI after');
+Map.addLayer(NDWI_before, ndwiParams, 'NDWI before', false);
+
+
+// figure out date for aquired NDWI after image
+var dates_ndwi_after = optical_after_stack.map(function(image) {
+      return ee.Feature(null, {'date': image.date().format('YYYY-MM-dd')})
+    })
+    .distinct('date')
+    .aggregate_array('date');
+    
+print(dates_ndwi_after,'Dates S2 after');
+
+var dates_ndwi_before = optical_before_stack.map(function(image) {
+      return ee.Feature(null, {'date': image.date().format('YYYY-MM-dd')})
+    })
+    .distinct('date')
+    .aggregate_array('date');
+    
+print(dates_ndwi_before,'Dates S2 before');
+
+//NDWI flood mask
+//Making a flood treshold for ndwi -0.1 works much better than 0 for threshold
+var floodNDWI = NDWI_before.lt(-0.1).and(NDWI_after.gt(-0.1));
+var flood_maskNDWI = floodNDWI.updateMask(floodNDWI.eq(1));
+
+//Make a class for ndwi and ratio for further calculations of total inundated area
+var classNDWI = flood_maskNDWI.reduce('sum').toInt();
+Map.addLayer(classNDWI.clip(g2), {palette:['black']}, 'Classified NDWI');
+
+var classRatio = floodmask_ratio.reduce('sum').toInt();
+// print(classRatio,'ClassRatio');
+Map.addLayer(classRatio.clip(g2), {palette:['black']}, 'Classified Ratio');
+Map.addLayer(flood_maskNDWI, {palette:['Red']}, 'NDWI flood mask', false);
+
+///////////////////////////////////////////////
+// 4_S1 imagery and_ S1 automatic flood detection //
+///////////////////////////////////////////////
+
+//Create a before and after image of the flooded areas in Pakistan
+
+var collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+        .filter(ee.Filter.eq('instrumentMode', 'IW'))
+        .filter(ee.Filter.eq('resolution','H'))
+        .filter(ee.Filter.or(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'),ee.Filter.eq('orbitProperties_pass', 'ASCENDING')))
+        .filter(ee.Filter.or(ee.Filter.eq('relativeOrbitNumber_start', 71),ee.Filter.eq('relativeOrbitNumber_stop',71)));
+       
+var before = collection.filter(ee.Filter.date('2022-03-01', '2022-06-01')).filterBounds(g2);
+var after = collection.filter(ee.Filter.date('2022-08-28', '2022-09-03')).filterBounds(g2);
+print(before)
+print(after)
+
+// figure out date for aquired S1 after image and reference stack
+var date_S1_after = after.map(function(image) {
+      return ee.Feature(null, {'date': image.date().format('YYYY-MM-dd')})
+    })
+    .distinct('date')
+    .aggregate_array('date');
+    
+print(date_S1_after,'Dates S1 after');
+
+var date_S1_stack = before.map(function(image){
+  return ee.Feature(null, {'date': image.date().format('YYYY-MM-dd')})
+})
+.distinct('date')
+.aggregate_array('date');
+
+print(date_S1_stack, 'Dates S1 reference');
+
+// figure out relative orbit number start for aquired S1 after image
+var OrbitStart_S1 = after.aggregate_array("relativeOrbitNumber_start");
+print(OrbitStart_S1,'S1_after relative orbit number start');
+
+// figure out relative orbit number stop for aquired S1 after image
+var OrbitStop_S1 = after.aggregate_array("relativeOrbitNumber_stop");
+print(OrbitStop_S1,'S1_after relative orbit number stop');
+
+
+var before_image_VH = before.select('VH').mean().clip(g2);
+var after_image_VH = after.select('VH').mean().clip(g2);
+
+var before_image_VV = before.select('VV').mean().clip(g2);
+var after_image_VV = after.select('VV').mean().clip(g2);
+
+var before_filtered_VH = ee.Image(toDB(RefinedLee(toNatural(before_image_VH))))
+var after_filtered_VH = ee.Image(toDB(RefinedLee(toNatural(after_image_VH))))
+
+var before_filtered_VV = ee.Image(toDB(RefinedLee(toNatural(before_image_VV))))
+var after_filtered_VV = ee.Image(toDB(RefinedLee(toNatural(after_image_VV))))
+
+//Create backscatter thresholds for "flooded" areas
+//-23, -15
+var flood_VH = before_filtered_VH.gt(-23).and(after_filtered_VH.lt(-23));
+var flood_mask_VH = flood_VH.updateMask(flood_VH.eq(1));
+
+var flood_VV = before_filtered_VV.gt(-15).and(after_filtered_VV.lt(-15));
+var flood_mask_VV = flood_VV.updateMask(flood_VV.eq(1));
+
+//Showing filtered VH and VV images before and after flood
+Map.addLayer(before_filtered_VH,{min: -25,max: 0}, 'before_filtered_VH', false)
+Map.addLayer(after_filtered_VH,{min: -25,max: 0}, 'after_filtered_VH', false)
+
+Map.addLayer(before_filtered_VV,{min: -25,max: 0}, 'before_filtered_VV', false)
+Map.addLayer(after_filtered_VV,{min: -25,max: 0}, 'after_filtered_VV', false)
+
+
+////////////////////////////////////////////////////
+// 5_Speckle Filtering Functions by Guido Lemoine //
+////////////////////////////////////////////////////
+//https://github.com/senbox-org/s1tbx/blob/master/s1tbx-op-sar-processing/src/main/java/org/esa/s1tbx/sar/gpf/filtering/SpeckleFilters/RefinedLee.java
+// Function to convert from d
+function toNatural(img) {
+  return ee.Image(10.0).pow(img.select(0).divide(10.0));
+}
+
+//Function to convert to dB
+function toDB(img) {
+  return ee.Image(img).log10().multiply(10.0);
+}
+
+function RefinedLee(img) {
+  // img must be in natural units, i.e. not in dB!
+  // Set up 3x3 kernels 
+  var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+  var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+
+  var mean3 = img.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+  var variance3 = img.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+
+  // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+  var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+
+  var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+
+  // Calculate mean and variance for the sampled windows and store as 9 bands
+  var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+  var sample_var = variance3.neighborhoodToBands(sample_kernel);
+
+  // Determine the 4 gradients for the sampled windows
+  var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+  gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+  gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+  gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+
+  // And find the maximum gradient amongst gradient bands
+  var max_gradient = gradients.reduce(ee.Reducer.max());
+
+  // Create a mask for band pixels that are the maximum gradient
+  var gradmask = gradients.eq(max_gradient);
+
+  // duplicate gradmask bands: each gradient represents 2 directions
+  gradmask = gradmask.addBands(gradmask);
+
+  // Determine the 8 directions
+  var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+  directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+  directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+  directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+  // The next 4 are the not() of the previous 4
+  directions = directions.addBands(directions.select(0).not().multiply(5));
+  directions = directions.addBands(directions.select(1).not().multiply(6));
+  directions = directions.addBands(directions.select(2).not().multiply(7));
+  directions = directions.addBands(directions.select(3).not().multiply(8));
+
+  // Mask all values that are not 1-8
+  directions = directions.updateMask(gradmask);
+
+  // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+  directions = directions.reduce(ee.Reducer.sum());  
+
+  //var pal = ['ffffff','ff0000','ffff00', '00ff00', '00ffff', '0000ff', 'ff00ff', '000000'];
+  //Map.addLayer(directions.reduce(ee.Reducer.sum()), {min:1, max:8, palette: pal}, 'Directions', false);
+
+  var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+
+  // Calculate localNoiseVariance
+  var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+
+  // Set up the 7*7 kernels for directional statistics
+  var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+
+  var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+    [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+
+  var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+  var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+
+  // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+  var dir_mean = img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+  var dir_var = img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+
+  dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+  dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+
+  // and add the bands for rotated kernels
+  for (var i=1; i<4; i++) {
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+  }
+
+  // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+  dir_mean = dir_mean.reduce(ee.Reducer.sum());
+  dir_var = dir_var.reduce(ee.Reducer.sum());
+
+  // A finally generate the filtered value
+  var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+
+  var b = varX.divide(dir_var);
+
+  var result = dir_mean.add(b.multiply(img.subtract(dir_mean)));
+  return(result.arrayFlatten([['sum']]));
+}
+
+///////////////////////////////////////
+// 6 Pixel, slope and elevation mask //
+///////////////////////////////////////
+
+var connected_pixels = 8;
+var connections_VH = flood_mask_VH.connectedPixelCount(25);
+var connections_VV = flood_mask_VV.connectedPixelCount(25);
+var separated_areas_VH = connections_VH.lt(connected_pixels);
+var separated_areas_VV = connections_VV.lt(connected_pixels);
+var separated_areas_mask_VH = separated_areas_VH.not();
+var separated_areas_mask_VV = separated_areas_VV.not();
+Map.addLayer(separated_areas_VH.selfMask(), {min:0, max:1, palette: ['yellow']}, 'Disconnected Areas VH', false);
+Map.addLayer(separated_areas_VV.selfMask(), {min:0, max:1, palette: ['yellow']}, 'Disconnected Areas VV', false);
+
+var flood_mask_VH = flood_mask_VH.updateMask(separated_areas_mask_VH);
+var flood_mask_VV = flood_mask_VV.updateMask(separated_areas_mask_VV);
+
+//GET A PALETTE
+var palettes = require('users/gena/packages:palettes');
+
+
+//Here we use AW3D DSM to detect areas that have a slope dip above 5 degrees 
+//and find elevation limit for study area in question
+var dataset = ee.ImageCollection('JAXA/ALOS/AW3D30/V3_2').select('DSM');
+var elevation = dataset.filterBounds(g2);
+var elevation2 = dataset.mosaic().clip(g2);
+var elevationVis = {
+  min: 0,
+  max: 5000,
+  palette: ['0000ff', '00ffff', 'ffff00', 'ff0000', 'ffffff']
+};
+Map.addLayer(elevation2, elevationVis, 'Elevation', false);
+
+// Reproject an image mosaic using a projection from one of the image tiles,
+// rather than using the default projection returned by .mosaic().
+var proj = elevation.first().select(0).projection();
+var slopeReprojected = ee.Terrain.slope(elevation.mosaic()
+                             .setDefaultProjection(proj));
+                             
+var highreproj = elevation.mosaic().setDefaultProjection(proj);
+
+var slopeClip = slopeReprojected.clip(g2);
+Map.addLayer(slopeClip, {min: 0, max: 30, palette: elevationVis}, 'Slope', false);
+
+//mask out areas with more than 5 percent slope and mask out elevation over a certain limit
+var elevationtreshold = 250;
+var slopetreshold = 5;
+var steepareas = slopeReprojected.gt(slopetreshold);
+var high = highreproj.gt(elevationtreshold);
+var highmask = high.not();
+var slopemask = steepareas.not();
+var slopehigh = slopeReprojected.gt(slopetreshold).and(high);
+var slopa = slopehigh.not();
+Map.addLayer(high.clip(g2).selfMask(), {min:0, max:1, palette: ['green']}, 'High Areas', false);
+Map.addLayer(steepareas.clip(g2).selfMask(), {min:0, max:1, palette: ['cyan']}, 'Steep Areas', false);
+Map.addLayer(slopehigh.clip(g2).selfMask(), {min:0, max:1, palette: ['orange']}, 'SH', false);
+
+//Updating the flood for the slope threshold
+var flood_mask_VH_slope = flood_mask_VH.updateMask(slopemask);
+var flood_mask_VV_slope = flood_mask_VV.updateMask(slopemask);
+
+//Updating the flood for the elevation threshold 
+var flood_mask_VH_high = flood_mask_VH.updateMask(highmask);
+var flood_mask_VV_high = flood_mask_VV.updateMask(highmask);
+
+//Updating the flood for the elevation and slope threshold 
+var flood_mask_VH_sh = flood_mask_VH.updateMask(slopa);
+var flood_mask_VV_sh = flood_mask_VV.updateMask(slopa);
+
+//Updating the ndwi flood for the elevation and slope threshold
+var classNDWI_slope = classNDWI.updateMask(slopemask);
+var classNDWI_high = classNDWI.updateMask(highmask);
+var classNDWI_sh = classNDWI.updateMask(slopa);
+
+
+//updating the ratio flood for the elevation and slope threshold
+var classRatio_slope = classRatio.updateMask(slopemask);
+var classRatio_high = classRatio.updateMask(highmask);
+var classRatio_sh = classRatio.updateMask(slopa);
+
+// we add maps for: , flood mask with slope, 
+//flood mask with elevation, flood mask with slope and elevation
+
+//1. flood mask without slope and elevation
+Map.addLayer(flood_mask_VH,{palette:['Red']}, 'Flood_Inudation VH', false);
+Map.addLayer(flood_mask_VV,{palette:['Red']}, 'Flood_Inudation VV', false);
+
+//2. flood mask with slope
+Map.addLayer(flood_mask_VH_slope,{palette:['Red']}, 'Flood_Inudation with slope VH', false);
+Map.addLayer(flood_mask_VV_slope,{palette:['Red']}, 'Flood_Inudation with slope VV', false);
+
+//3. flood mask with elevation
+Map.addLayer(flood_mask_VH_high,{palette:['Red']}, 'Flood_Inudation with elevation VH', false);
+Map.addLayer(flood_mask_VV_high,{palette:['Red']}, 'Flood_Inudation with elevation VV', false);
+
+//4. flood mask with elevation and slope included
+Map.addLayer(flood_mask_VH_sh,{palette:['Red']}, 'Flood_Inudation with e and s VH');
+Map.addLayer(flood_mask_VV_sh,{palette:['Red']}, 'Flood_Inudation with e and s VV');
+
+//5. ndwi flood mask slope
+//Map.addLayer(classNDWI_slope,{palette:['Green']}, 'NDWI flood slope', false);
+
+//6. ndwi flood mask elevation 
+//Map.addLayer(classNDWI_high,{palette:['Green']}, 'NDWI flood ele', false);
+
+//7. ndwi flood mask sh
+Map.addLayer(classNDWI_sh,{palette:['Green']}, 'NDWI flood sh', false);
+
+//8. ratio flood mask sh
+Map.addLayer(classRatio_sh,{palette:['Magenta']}, 'Ratio flood sh', false);
+
+///////////////////////////////////////////////////
+// 7 land cover data used in chapter 2 of thesis //
+//////////////////////////////////////////////////
+//var LandCover = ee.ImageCollection("COPERNICUS/Landcover/100m/Proba-V-C3/Global");
+// var lc_layyah = LandCover
+// .filter(ee.Filter.date('2015-01-28', '2016-09-01'))
+// .filterBounds(g2);
+
+// var lc_layyah1 = lc_layyah.first().clip(g2);
+// var paletteLC = {
+//   bands: ['discrete_classification'],
+// };
+// Map.addLayer(lc_layyah1, paletteLC, 'Land Cover' );
+
+var proj1 = before.first().select(0).projection();
+print(proj1)
+
+
+/////////////////////////////////////////
+/// 8. Calculate total inundated areas ///
+/////////////////////////////////////////
+
+// code that prints total area of the flooded area
+var stats_VH = flood_mask_VH.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:32642',
+  maxPixels: 1e13,
+  tileScale: 16
+})
+
+//print(stats_VH);
+var flood_area_VH = ee.Number(stats_VH.get('sum')).divide(1000000);
+print('Flooded Area VH (KM2)', flood_area_VH)
+
+var stats_VV = flood_mask_VV.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:32642',
+  maxPixels: 1e13,
+  tileScale: 16
+})
+
+//print(stats_VV);
+var flood_area_VV = ee.Number(stats_VV.get('sum')).divide(1000000);
+print('Flooded Area VV (KM2)', flood_area_VV)
+
+
+// code that prints total area of the flooded area, including slope/elevation mask
+var stats_VH_sh = flood_mask_VH_sh.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:32642',
+  maxPixels: 1e13,
+  tileScale: 16
+})
+
+//print(stats_VH_sh);
+var flood_area_VH_sh = ee.Number(stats_VH_sh.get('sum')).divide(1000000);
+print('Flooded Area VH SH (KM2)', flood_area_VH_sh)
+
+var stats_VV_sh = flood_mask_VV_sh.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:32642',
+  maxPixels: 1e13,
+  tileScale: 16
+})
+
+//print(stats_VV_sh);
+var flood_area_VV_sh = ee.Number(stats_VV_sh.get('sum')).divide(1000000);
+print('Flooded Area SH VV (KM2)', flood_area_VV_sh)
+
+var stats_ndwi = classNDWI.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  tileScale: 16
+});
+
+print(stats_ndwi);
+var flood_area_ndwi = ee.Number(stats_ndwi.get('sum')).divide(1000000); //b8 and b3 pixels are 10x10m pixel res
+print('Flooded Area NDWI (KM2)', flood_area_ndwi);
+
+var stats_ndwi_sh = classNDWI_sh.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  tileScale: 16
+});
+
+print(stats_ndwi_sh);
+var flood_area_ndwi_sh = ee.Number(stats_ndwi_sh.get('sum')).divide(1000000); //b8 and b3 pixels are 10x10m pixel res
+print('Flooded Area NDWI SH (KM2)', flood_area_ndwi_sh);
+
+var vis_Saro = {
+  bands: ['sum'],
+  min: -25,
+  max: 0,
+  gamma: [1]
+};
+
+var stats_ratio = classRatio.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  tileScale: 16
+});
+
+var flood_area_ratio =  ee.Number(stats_ratio.get('sum')).divide(1000000); //b8 and b3 pixels are 10x10m pixel res
+print('Flooded Area Ratio (KM2)', flood_area_ratio);
+
+var stats_ratio_sh = classRatio_sh.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  tileScale: 16
+});
+
+var flood_area_ratio_sh =  ee.Number(stats_ratio_sh.get('sum')).divide(1000000); //b8 and b3 pixels are 10x10m pixel res
+print('Flooded Area Ratio sh (KM2)', flood_area_ratio_sh);
+
+/////////////////////////////////////////////
+///// 9. Intersection of S1 and S2 imagery // 
+///// and calculated area of intersect //////
+/////////////////////////////////////////////
+
+// find intersection between s1 vv and s2, we use the masks that include SEM
+var floodIntersection1 = flood_mask_VV_sh.and(classNDWI);
+var floodIntersection2 = flood_mask_VH_sh.and(classNDWI);
+var floodIntersection3 = flood_mask_VV_sh.and(flood_mask_VH_sh);
+var floodIntersection4 = classRatio_sh.and(flood_mask_VH_sh);
+var floodIntersection5 = classRatio_sh.and(flood_mask_VV_sh);
+var floodIntersection6 = classRatio_sh.and(flood_maskNDWI);
+
+Map.addLayer(floodIntersection1,{ palette: ['magenta']},"intersect of vv and ndwi", false);
+Map.addLayer(floodIntersection2,{ palette: ['cyan']},"intersect of vh and ndwi", false);
+Map.addLayer(floodIntersection3,{ palette: ['lime']},"intersect of vh and vv", false);
+Map.addLayer(floodIntersection4,{ palette: ['crimson']},"intersect of ratio and vh", false);
+Map.addLayer(floodIntersection5,{ palette: ['salmon']},"intersect of ratio and vv", false);
+Map.addLayer(floodIntersection6,{ palette: ['teal']},"intersect of ratio and ndwi", false);
+
+var interesectionarea1 = floodIntersection1.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  tileScale: 16,
+  maxPixels: 1e13
+});
+
+var flood_area_interesectionarea1 = ee.Number(interesectionarea1.get('sum')).divide(1000000); 
+print('Flooded Area intersection vv ndwi (KM2)', flood_area_interesectionarea1);
+
+var interesectionarea2 = floodIntersection2.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  tileScale: 16,
+  maxPixels: 1e13
+});
+
+
+var flood_area_interesectionarea2 = ee.Number(interesectionarea2.get('sum')).divide(1000000); 
+print('Flooded Area intersection vh ndwi (KM2)', flood_area_interesectionarea2);
+
+var interesectionarea3 = floodIntersection3.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  tileScale: 16,
+  maxPixels: 1e13
+});
+
+var flood_area_interesectionarea3 = ee.Number(interesectionarea3.get('sum')).divide(1000000); 
+print('Flooded Area intersection vh and vv (KM2)', flood_area_interesectionarea3);
+
+var interesectionarea4 = floodIntersection4.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  tileScale: 16,
+  maxPixels: 1e13
+});
+
+var flood_area_interesectionarea4 = ee.Number(interesectionarea4.get('sum')).divide(1000000); 
+print('Flooded Area intersection ratio and vh (KM2)', flood_area_interesectionarea4);
+
+var interesectionarea5 = floodIntersection5.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  tileScale: 16,
+  maxPixels: 1e13
+});
+
+var flood_area_interesectionarea5 = ee.Number(interesectionarea5.get('sum')).divide(1000000); 
+print('Flooded Area intersection ratio and vv (KM2)', flood_area_interesectionarea5);
+
+var interesectionarea6 = floodIntersection6.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: g2,
+  scale: 30,
+  crs: 'EPSG:4326',
+  tileScale: 16,
+  maxPixels: 1e13
+});
+
+var flood_area_interesectionarea6 = ee.Number(interesectionarea6.get('sum')).divide(1000000); 
+print('Flooded Area intersection ratio and ndwi (KM2)', flood_area_interesectionarea6);
+

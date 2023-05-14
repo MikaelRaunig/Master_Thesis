@@ -191,8 +191,8 @@ var flood_mask_VV = flood_VV.updateMask(flood_VV.eq(1));
 Map.addLayer(before_filtered_VH,{min: -25,max: 0}, 'before_filtered VH', false)
 Map.addLayer(after_filtered_VH,{min: -25,max: 0}, 'after_filtered VH')
 
-Map.addLayer(before_filtered_VV,{min: -25,max: 0}, 'before_filtered VV', false)
-Map.addLayer(after_filtered_VV,{min: -25,max: 0}, 'after_filtered VV')
+Map.addLayer(before_filtered_VV,{min: -19,max: 0}, 'before_filtered VV', false)
+Map.addLayer(after_filtered_VV,{min: -19,max: 0}, 'after_filtered VV')
 
 
 /////////////////////////////////////
